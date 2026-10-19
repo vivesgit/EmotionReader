@@ -10,6 +10,12 @@ import numpy as np
 
 SAMPLE_RATE = 24_000
 MAX_RECORDING_SECONDS = 60
+# Python callbacks compete for the GIL with the camera and emotion threads; a low-latency
+# stream misses deadlines and crackles.
+STREAM_LATENCY_SECONDS = 0.2
+# Audio deltas arrive in bursts; play only once this much is queued so the network jitter
+# never reaches the speaker.
+PREBUFFER_SECONDS = 0.3
 
 
 class AudioDeviceError(RuntimeError):
@@ -37,6 +43,35 @@ def resample_pcm16(pcm: bytes, from_rate: int, to_rate: int) -> bytes:
     return np.clip(resampled, -32768, 32767).astype(np.int16).tobytes()
 
 
+class StreamResampler:
+    """Resamples consecutive chunks as one continuous signal (no clicks at chunk joins)."""
+
+    def __init__(self, from_rate: int, to_rate: int) -> None:
+        self._step = from_rate / to_rate
+        self._passthrough = from_rate == to_rate
+        self.reset()
+
+    def reset(self) -> None:
+        self._last: np.ndarray | None = None
+        self._position = 0.0
+
+    def process(self, pcm: bytes) -> bytes:
+        if self._passthrough or not pcm:
+            return pcm
+        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+        if self._last is not None:
+            samples = np.concatenate((self._last, samples))
+        end = len(samples) - 1
+        count = 0
+        if end >= self._position:
+            count = int(np.floor((end - self._position) / self._step)) + 1
+        positions = self._position + np.arange(count) * self._step
+        resampled = np.interp(positions, np.arange(len(samples)), samples)
+        self._position = self._position + count * self._step - end
+        self._last = samples[-1:]
+        return np.clip(np.round(resampled), -32768, 32767).astype(np.int16).tobytes()
+
+
 def _open_stream(sd: ModuleType, kind: str, callback: Callable) -> tuple[object, int]:
     """Open at 24 kHz, falling back to the device's native rate when it is unsupported."""
     stream_class = sd.RawInputStream if kind == "input" else sd.RawOutputStream
@@ -49,7 +84,13 @@ def _open_stream(sd: ModuleType, kind: str, callback: Callable) -> tuple[object,
     last_error: Exception | None = None
     for rate in dict.fromkeys(rates):
         try:
-            stream = stream_class(samplerate=rate, channels=1, dtype="int16", callback=callback)
+            stream = stream_class(
+                samplerate=rate,
+                channels=1,
+                dtype="int16",
+                latency=STREAM_LATENCY_SECONDS,
+                callback=callback,
+            )
             stream.start()
             return stream, rate
         except Exception as exc:
@@ -112,6 +153,8 @@ class AudioPlayer:
         self._rate = SAMPLE_RATE
         self._buffer = bytearray()
         self._finishing = False
+        self._prebuffering = True
+        self._resampler = StreamResampler(SAMPLE_RATE, SAMPLE_RATE)
         self._lock = threading.Lock()
 
     @property
@@ -123,16 +166,25 @@ class AudioPlayer:
         if self._stream is None:
             sd = self._sd or _sounddevice()
             self._stream, self._rate = _open_stream(sd, "output", self._callback)
+            self._resampler = StreamResampler(SAMPLE_RATE, self._rate)
 
     def _callback(self, outdata, frames, _time, _status) -> None:
         needed = frames * 2
         drained = False
         with self._lock:
+            if self._prebuffering and not self._finishing:
+                if len(self._buffer) < PREBUFFER_SECONDS * self._rate * 2:
+                    outdata[:] = b"\x00" * needed
+                    return
+                self._prebuffering = False
             chunk = bytes(self._buffer[:needed])
             del self._buffer[:needed]
-            if self._finishing and not self._buffer:
-                self._finishing = False
-                drained = True
+            if not self._buffer:
+                self._prebuffering = True
+                if self._finishing:
+                    self._finishing = False
+                    self._resampler.reset()
+                    drained = True
         outdata[: len(chunk)] = chunk
         outdata[len(chunk) :] = b"\x00" * (needed - len(chunk))
         if drained and self.on_drained is not None:
@@ -140,9 +192,8 @@ class AudioPlayer:
 
     def feed(self, pcm: bytes) -> None:
         self._ensure_stream()
-        data = resample_pcm16(pcm, SAMPLE_RATE, self._rate)
         with self._lock:
-            self._buffer.extend(data)
+            self._buffer.extend(self._resampler.process(pcm))
 
     def finish(self) -> None:
         """Mark the end of the response; `on_drained` fires once the buffer empties."""
@@ -159,6 +210,8 @@ class AudioPlayer:
         with self._lock:
             self._buffer.clear()
             self._finishing = False
+            self._prebuffering = True
+            self._resampler.reset()
 
     def close(self) -> None:
         self.stop()

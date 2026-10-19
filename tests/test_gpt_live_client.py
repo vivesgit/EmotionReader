@@ -8,10 +8,13 @@ from openai import AsyncOpenAI
 from config import Settings
 from gpt_live_client import audio as audio_module
 from gpt_live_client.audio import (
+    PREBUFFER_SECONDS,
     SAMPLE_RATE,
+    STREAM_LATENCY_SECONDS,
     AudioDeviceError,
     AudioPlayer,
     MicRecorder,
+    StreamResampler,
     resample_pcm16,
 )
 from gpt_live_client.client import (
@@ -292,11 +295,12 @@ def test_new_chat_starts_fresh_session():
 
 
 class FakeStream:
-    def __init__(self, samplerate, channels, dtype, callback, supported=(SAMPLE_RATE,)):
+    def __init__(self, samplerate, channels, dtype, latency, callback, supported=(SAMPLE_RATE,)):
         if samplerate not in supported:
             raise ValueError("Invalid sample rate")
         assert (channels, dtype) == (1, "int16")
         self.samplerate = samplerate
+        self.latency = latency
         self.callback = callback
         self.started = self.closed = False
 
@@ -359,6 +363,49 @@ def test_player_streams_chunks_and_reports_drain():
     assert pull(stream, 60) == b"\x01\x00" * 40 + b"\x00\x00" * 20
     assert drained == [True]
     assert not player.playing
+
+
+def test_player_waits_for_prebuffer_before_playing():
+    sd = FakeSoundDevice()
+    player = AudioPlayer(None, sd)
+    prebuffer = int(PREBUFFER_SECONDS * SAMPLE_RATE)
+    player.feed(b"\x01\x00" * (prebuffer - 1))
+    stream = sd.streams[0]
+    assert stream.latency == STREAM_LATENCY_SECONDS
+    assert pull(stream, 10) == b"\x00\x00" * 10
+    player.feed(b"\x01\x00")
+    assert pull(stream, 10) == b"\x01\x00" * 10
+
+
+def test_player_rebuffers_after_underrun():
+    sd = FakeSoundDevice()
+    player = AudioPlayer(None, sd)
+    prebuffer = int(PREBUFFER_SECONDS * SAMPLE_RATE)
+    player.feed(b"\x01\x00" * prebuffer)
+    stream = sd.streams[0]
+    pull(stream, prebuffer)
+    player.feed(b"\x02\x00" * 10)
+    assert pull(stream, 10) == b"\x00\x00" * 10
+    player.feed(b"\x02\x00" * prebuffer)
+    assert pull(stream, 10) == b"\x02\x00" * 10
+
+
+@pytest.mark.parametrize("rate", [44_100, 48_000])
+def test_stream_resampler_has_no_clicks_between_chunks(rate):
+    t = np.arange(SAMPLE_RATE) / SAMPLE_RATE
+    signal = (np.sin(2 * np.pi * 220 * t) * 12_000).astype(np.int16)
+    resampler = StreamResampler(SAMPLE_RATE, rate)
+    rng = np.random.default_rng(0)
+    parts, start = [], 0
+    while start < len(signal):
+        size = int(rng.integers(800, 4800))
+        parts.append(resampler.process(signal[start : start + size].tobytes()))
+        start += size
+    out = np.frombuffer(b"".join(parts), dtype=np.int16).astype(np.int32)
+    positions = np.arange(len(out)) * SAMPLE_RATE / rate
+    one_shot = np.round(np.interp(positions, np.arange(len(signal)), signal)).astype(np.int32)
+    assert abs(len(out) - rate) <= 1
+    assert np.abs(out - one_shot).max() <= 1
 
 
 def test_player_finish_without_audio_drains_immediately():
