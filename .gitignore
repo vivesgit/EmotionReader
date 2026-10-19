@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Downloaded emotion models
+models/
+
+# PyInstaller output
+build/
+dist/
+
+# macOS
+.DS_Store

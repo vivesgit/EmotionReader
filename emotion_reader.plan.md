@@ -4,7 +4,7 @@ overview: 'Una app de escritorio en Python, con PySide6, que detecta emociones e
 todos:
   - id: phase-a-env
     content: 'Fase (a.1): crear el entorno: estructura completa de carpetas y archivos vacíos con __init__.py, requirements.txt, requirements-dev.txt, .gitignore, .env.example (fuente única de variables), config.py y comprobación de que el venv instala sin errores'
-    status: pending
+    status: completed
   - id: phase-a-ui
     content: 'Fase (a.2): permisos de cámara y micrófono con Qt, CameraWorker con OpenCV y ventana PySide6 con vídeo, botones, campo de texto, indicador de cámara, estado y aviso de privacidad, más sus tests'
     status: pending
@@ -75,6 +75,7 @@ tests/
   test_ui.py
 packaging/emotion_reader.spec
 requirements.txt, requirements-dev.txt, .gitignore, README.md
+pyproject.toml              # solo configuración de ruff y pytest
 ```
 Respecto a la v1, he fusionado lo siguiente: `permissions.py` pasa a `camera.py`, `models.py` a `aggregator.py`, `history.py`, `errors.py` y `worker.py` a `client.py`, el micrófono y el reproductor a `audio.py`, y la parte de vídeo y estados a `main_window.py`. El script de descarga de modelos lo sustituye una descarga automática en `detector.py`, y los tests quedan en un archivo por módulo.
 
