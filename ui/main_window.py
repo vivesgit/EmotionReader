@@ -36,7 +36,7 @@ from emotion_reader.camera import (
 )
 from emotion_reader.detector import EmotionDetector, EmotionReading, EmotionWorker
 from emotion_reader.prompt import build_prompt
-from gpt_live_client.audio import AudioDeviceError, MicRecorder
+from gpt_live_client.audio import SAMPLE_RATE, AudioDeviceError, MicRecorder
 from gpt_live_client.client import GptLiveBridge
 
 MIC_DENIED_MESSAGE = (
@@ -137,6 +137,7 @@ class MainWindow(QMainWindow):
     voice_question_started = Signal()
     voice_question_finished = Signal()
     new_chat_requested = Signal()
+    prompt_sent = Signal(str, float)  # prompt, seconds of voice audio (0 for a text question)
 
     def __init__(
         self,
@@ -445,6 +446,7 @@ class MainWindow(QMainWindow):
             return
         prompt = build_prompt(self.emotion_summary(), question)
         self.last_prompt = prompt
+        self.prompt_sent.emit(prompt, len(audio) / (2 * SAMPLE_RATE) if audio else 0.0)
         self.set_caption(f"Tú: {question}" if question else "Tú: (pregunta por voz)")
         self.set_status(Status.PROCESSING)
         self.assistant.ask(prompt, audio or None)

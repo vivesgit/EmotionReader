@@ -323,15 +323,17 @@ def make_live_window(qtbot):
     return factory
 
 
-def test_voice_question_records_and_sends_prompt(make_live_window, clock):
+def test_voice_question_records_and_sends_prompt(make_live_window, clock, qtbot):
     window, assistant, recorder = make_live_window()
     window.ask_button.pressed.emit()
     assert recorder.recording and recorder.starts == 1
     assert window.status is Status.LISTENING
     clock[0] += 1.5
-    window.ask_button.released.emit()
+    with qtbot.waitSignal(window.prompt_sent) as sent:
+        window.ask_button.released.emit()
     assert not recorder.recording
     prompt, audio = assistant.asks[0]
+    assert sent.args == [prompt, 0.1]
     assert audio == b"\x01\x00" * 2400
     assert prompt.startswith("[Contexto emocional estimado del usuario, últimos 5 s")
     assert prompt.endswith(f"[Pregunta del usuario]: {VOICE_QUESTION}")
@@ -348,11 +350,13 @@ def test_short_tap_discards_recording(make_live_window, clock):
     assert assistant.asks == []
 
 
-def test_text_question_sends_prompt_and_clears_field(make_live_window):
+def test_text_question_sends_prompt_and_clears_field(make_live_window, qtbot):
     window, assistant, recorder = make_live_window()
     window.question_input.setText("¿Qué me recomiendas?")
-    window.ask_button.click()
+    with qtbot.waitSignal(window.prompt_sent) as sent:
+        window.ask_button.click()
     prompt, audio = assistant.asks[0]
+    assert sent.args == [prompt, 0.0]
     assert audio is None
     assert prompt.endswith("[Pregunta del usuario]: ¿Qué me recomiendas?")
     assert recorder.starts == 0
@@ -425,3 +429,18 @@ def test_close_shuts_down_assistant(make_live_window):
     window, assistant, _ = make_live_window()
     window.close()
     assert assistant.shutdowns == 1
+
+
+def test_prompt_printer_numbers_each_prompt():
+    import io
+
+    from main import prompt_printer
+
+    out = io.StringIO()
+    print_prompt = prompt_printer("gpt-realtime-2.1", out)
+    print_prompt("[Contexto]\n[Pregunta del usuario]: hola", 0.0)
+    print_prompt("[Contexto]\n[Pregunta del usuario]: adiós", 1.5)
+    text = out.getvalue()
+    assert "Prompt #1" in text and "Prompt #2" in text
+    assert "voz, 1.5 s de audio → gpt-realtime-2.1" in text
+    assert "\033[" not in text

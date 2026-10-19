@@ -17,7 +17,12 @@ from emotion_reader.detector import (
     ModelDownloadError,
     ensure_model,
 )
-from emotion_reader.prompt import VOICE_QUESTION, build_emotion_context, build_prompt
+from emotion_reader.prompt import (
+    VOICE_QUESTION,
+    build_emotion_context,
+    build_prompt,
+    format_prompt_log,
+)
 
 FACE_IMAGE = Path(__file__).parent / "data" / "face.jpg"
 LABELS = list(EMOTION_LABELS_ES.values())
@@ -431,3 +436,31 @@ def test_prompt_is_short_plain_text():
     prompt = build_prompt(EXAMPLE_SUMMARY, "hola")
     assert all(ch.isprintable() or ch == "\n" for ch in prompt)
     assert len(prompt) < 1000
+
+
+def test_prompt_log_shows_full_prompt_framed():
+    from datetime import datetime
+
+    prompt = build_prompt(EXAMPLE_SUMMARY, "¿Qué hago hoy?")
+    log = format_prompt_log(prompt, 3, datetime(2026, 10, 19, 18, 56, 3), "gpt-realtime-2.1")
+    lines = log.splitlines()
+    assert lines[0].startswith("╭─ Prompt #3 · 18:56:03 · texto → gpt-realtime-2.1 ")
+    assert lines[-1].startswith("╰")
+    assert all(line.startswith("│") for line in lines[1:-1])
+    body = " ".join(line[1:].strip() for line in lines[1:-1] if line[1:].strip())
+    for original in prompt.splitlines()[:-1]:
+        assert original in body
+    assert "│   ¿Qué hago hoy?" in lines
+    assert "\033[" not in log
+    assert max(len(line) for line in lines) <= 80
+
+
+def test_prompt_log_voice_colour_and_wrapping():
+    from datetime import datetime
+
+    prompt = build_prompt(EXAMPLE_SUMMARY, None)
+    log = format_prompt_log(prompt, 1, datetime(2026, 1, 1), "m", 2.4, color=True, width=50)
+    assert "voz, 2.4 s de audio" in log
+    assert "\033[1m\033[33m[Pregunta del usuario]" in log
+    plain = format_prompt_log(prompt, 1, datetime(2026, 1, 1), "m", 2.4, width=50)
+    assert max(len(line) for line in plain.splitlines()[1:]) <= 50
