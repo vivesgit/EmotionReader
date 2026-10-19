@@ -11,6 +11,8 @@ from PySide6.QtWidgets import QApplication
 
 from config import ConfigError, load_settings
 from emotion_reader.camera import ImageCapture, SyntheticCapture, open_opencv_capture
+from gpt_live_client.audio import AudioPlayer, MicRecorder
+from gpt_live_client.client import GptLiveBridge, RealtimeClient
 from ui.main_window import MainWindow
 
 
@@ -50,7 +52,10 @@ def main(argv: list[str] | None = None) -> int:
 
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Emotion Reader")
-    window = MainWindow(settings, capture_factory=capture_factory)
+    assistant = GptLiveBridge(RealtimeClient(settings), AudioPlayer())
+    window = MainWindow(
+        settings, capture_factory=capture_factory, assistant=assistant, recorder=MicRecorder()
+    )
     signal.signal(signal.SIGINT, lambda *_: window.close())
     # Qt's event loop blocks Python signal handlers; waking it periodically lets Ctrl+C work.
     wake_timer = QTimer()

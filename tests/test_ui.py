@@ -1,7 +1,7 @@
 from functools import partial
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QMessageBox
 
@@ -13,6 +13,8 @@ from emotion_reader.camera import (
     SyntheticCapture,
 )
 from emotion_reader.detector import EMOTION_LABELS_ES, EmotionDetector, ModelDownloadError
+from emotion_reader.prompt import VOICE_QUESTION
+from gpt_live_client.audio import AudioDeviceError
 from ui import main_window
 from ui.main_window import PRIVACY_NOTICE, MainWindow, Status
 
@@ -249,3 +251,177 @@ def test_status_label(make_window, status):
     window.set_status(status, "detalle")
     assert window.status_label.text() == f"● {status.value} detalle"
     assert window.status is status
+
+
+# --- GPT-Live flow ----------------------------------------------------------
+
+
+class FakeAssistant(QObject):
+    audio_started = Signal()
+    answer_ready = Signal(str)
+    finished = Signal()
+    failed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.asks = []
+        self.cancels = 0
+        self.new_chats = 0
+        self.shutdowns = 0
+        self.busy = False
+
+    def ask(self, prompt, audio=None):
+        self.asks.append((prompt, audio))
+        self.busy = True
+
+    def cancel(self):
+        self.cancels += 1
+        self.busy = False
+
+    def new_chat(self):
+        self.new_chats += 1
+
+    def shutdown(self):
+        self.shutdowns += 1
+
+
+class FakeRecorder:
+    def __init__(self, error=None):
+        self.error = error
+        self.recording = False
+        self.starts = 0
+
+    def start(self):
+        if self.error:
+            raise self.error
+        self.starts += 1
+        self.recording = True
+
+    def stop(self):
+        self.recording = False
+        return b"\x01\x00" * 2400
+
+
+@pytest.fixture
+def make_live_window(qtbot):
+    def factory(recorder=None, permission=grant):
+        assistant = FakeAssistant()
+        recorder = recorder or FakeRecorder()
+        window = MainWindow(
+            Settings(),
+            capture_factory=lambda _i: SyntheticCapture(),
+            request_permission_fn=permission,
+            detector_factory=fake_detector,
+            assistant=assistant,
+            recorder=recorder,
+        )
+        qtbot.addWidget(window)
+        window.show()
+        window.request_microphone()
+        return window, assistant, recorder
+
+    return factory
+
+
+def test_voice_question_records_and_sends_prompt(make_live_window, clock):
+    window, assistant, recorder = make_live_window()
+    window.ask_button.pressed.emit()
+    assert recorder.recording and recorder.starts == 1
+    assert window.status is Status.LISTENING
+    clock[0] += 1.5
+    window.ask_button.released.emit()
+    assert not recorder.recording
+    prompt, audio = assistant.asks[0]
+    assert audio == b"\x01\x00" * 2400
+    assert prompt.startswith("[Contexto emocional estimado del usuario, últimos 5 s")
+    assert prompt.endswith(f"[Pregunta del usuario]: {VOICE_QUESTION}")
+    assert window.status is Status.PROCESSING
+    assert window.caption_label.text() == "Tú: (pregunta por voz)"
+
+
+def test_short_tap_discards_recording(make_live_window, clock):
+    window, assistant, recorder = make_live_window()
+    window.ask_button.pressed.emit()
+    clock[0] += 0.1
+    window.ask_button.released.emit()
+    assert not recorder.recording
+    assert assistant.asks == []
+
+
+def test_text_question_sends_prompt_and_clears_field(make_live_window):
+    window, assistant, recorder = make_live_window()
+    window.question_input.setText("¿Qué me recomiendas?")
+    window.ask_button.click()
+    prompt, audio = assistant.asks[0]
+    assert audio is None
+    assert prompt.endswith("[Pregunta del usuario]: ¿Qué me recomiendas?")
+    assert recorder.starts == 0
+    assert window.question_input.text() == ""
+    assert window.last_prompt == prompt
+
+
+def test_status_follows_answer_lifecycle(make_live_window):
+    window, assistant, _ = make_live_window()
+    window.question_input.setText("hola")
+    window.ask_button.click()
+    assert window.status is Status.PROCESSING
+    assistant.audio_started.emit()
+    assert window.status is Status.PLAYING
+    assistant.answer_ready.emit("Hola, ¿qué tal?")
+    assert window.caption_label.text() == "GPT-Live: Hola, ¿qué tal?"
+    assert window.caption_label.isVisible()
+    assistant.finished.emit()
+    assert window.status is Status.IDLE
+
+
+def test_assistant_failure_shows_error(make_live_window):
+    window, assistant, _ = make_live_window()
+    assistant.failed.emit("OpenAI ha rechazado la clave (OPENAI_API_KEY).")
+    assert window.status is Status.ERROR
+    assert window.message_box.windowTitle() == "GPT-Live no ha podido responder"
+    assert "OPENAI_API_KEY" in window.message_box.text()
+
+
+def test_pressing_while_answering_interrupts(make_live_window):
+    window, assistant, recorder = make_live_window()
+    assistant.busy = True
+    window.ask_button.pressed.emit()
+    assert assistant.cancels == 1
+    assert recorder.recording
+
+
+def test_new_chat_resets_conversation(make_live_window):
+    window, assistant, recorder = make_live_window()
+    window.ask_button.pressed.emit()
+    window.question_input.setText("pendiente")
+    window.set_caption("GPT-Live: algo")
+    window.new_chat_button.click()
+    assert assistant.new_chats == 1
+    assert not recorder.recording and not window.recording
+    assert window.question_input.text() == ""
+    assert not window.caption_label.isVisible()
+    assert window.status is Status.IDLE
+    assert "Nuevo chat" in window.status_label.text()
+
+
+def test_microphone_denied_shows_instructions(make_live_window):
+    window, assistant, recorder = make_live_window(permission=deny)
+    window.ask_button.pressed.emit()
+    assert recorder.starts == 0
+    assert not window.recording
+    assert window.message_box.windowTitle() == "Permiso de micrófono denegado"
+    assert "Privacidad y seguridad > Micrófono" in window.message_box.text()
+
+
+def test_missing_microphone_device_is_reported(make_live_window):
+    window, _, _ = make_live_window(recorder=FakeRecorder(AudioDeviceError("Sin micrófono.")))
+    window.ask_button.pressed.emit()
+    assert not window.recording
+    assert window.status is Status.ERROR
+    assert window.message_box.text() == "Sin micrófono."
+
+
+def test_close_shuts_down_assistant(make_live_window):
+    window, assistant, _ = make_live_window()
+    window.close()
+    assert assistant.shutdowns == 1

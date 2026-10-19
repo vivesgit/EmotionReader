@@ -35,6 +35,16 @@ from emotion_reader.camera import (
     request_permission,
 )
 from emotion_reader.detector import EmotionDetector, EmotionReading, EmotionWorker
+from emotion_reader.prompt import build_prompt
+from gpt_live_client.audio import AudioDeviceError, MicRecorder
+from gpt_live_client.client import GptLiveBridge
+
+MIC_DENIED_MESSAGE = (
+    "Emotion Reader no tiene permiso para usar el micrófono.\n\n"
+    "Para activarlo abre Ajustes del Sistema > Privacidad y seguridad > Micrófono "
+    "y activa el interruptor de Emotion Reader (o de tu Terminal si lo ejecutas "
+    "con «python main.py»). También puedes escribir la pregunta en el campo de texto."
+)
 
 PRIVACY_NOTICE = (
     "Privacidad: el vídeo se analiza solo en este equipo y nunca se guarda ni se envía. "
@@ -112,6 +122,13 @@ QPushButton#newChatButton { background: #353c47; }
 QPushButton#newChatButton:hover { background: #414955; }
 QPushButton#newChatButton:pressed { background: #2b313a; }
 QLabel#privacy { color: #6f7785; font-size: 12px; }
+QLabel#caption {
+    background: #1f242c;
+    border-radius: 16px;
+    padding: 10px 18px;
+    font-size: 15px;
+    color: #e6e9ee;
+}
 """
 
 
@@ -127,9 +144,15 @@ class MainWindow(QMainWindow):
         capture_factory: Callable[[int], VideoCapture] = open_opencv_capture,
         request_permission_fn: Callable[..., None] = request_permission,
         detector_factory: Callable[[], EmotionDetector] = EmotionDetector.load,
+        assistant: GptLiveBridge | None = None,
+        recorder: MicRecorder | None = None,
     ) -> None:
         super().__init__()
         self.settings = settings
+        self.assistant = assistant
+        self.recorder = recorder
+        self._mic_permission: PermissionState | None = None
+        self.last_prompt = ""
         self._capture_factory = capture_factory
         self._request_permission = request_permission_fn
         self._detector_factory = detector_factory
@@ -194,7 +217,18 @@ class MainWindow(QMainWindow):
         self.ask_button.released.connect(self._on_ask_released)
         self.new_chat_button = QPushButton("Empezar nuevo chat", objectName="newChatButton")
         self.new_chat_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.new_chat_button.clicked.connect(self.new_chat_requested.emit)
+        self.new_chat_button.clicked.connect(self._on_new_chat)
+
+        self.caption_label = QLabel(objectName="caption")
+        self.caption_label.setWordWrap(True)
+        self.caption_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.caption_label.hide()
+
+        if assistant is not None:
+            assistant.audio_started.connect(self._on_audio_started)
+            assistant.answer_ready.connect(self._on_answer)
+            assistant.finished.connect(self._on_answer_finished)
+            assistant.failed.connect(self._on_assistant_failed)
 
         buttons = QHBoxLayout()
         buttons.setSpacing(14)
@@ -216,6 +250,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(16)
         layout.addLayout(header)
         layout.addWidget(video_card, stretch=1)
+        layout.addWidget(self.caption_label)
         layout.addWidget(controls)
         layout.addWidget(self.privacy_label)
 
@@ -226,6 +261,8 @@ class MainWindow(QMainWindow):
 
     def start_camera(self) -> None:
         self._request_permission("camera", self._on_camera_permission, self)
+        if self.recorder is not None:
+            self.request_microphone()
 
     def _on_camera_permission(self, state: PermissionState) -> None:
         if state is not PermissionState.GRANTED:
@@ -358,6 +395,24 @@ class MainWindow(QMainWindow):
     def _on_ask_pressed(self) -> None:
         if self.question_input.text().strip():
             return
+        if self.assistant is not None and self.assistant.busy:
+            self.assistant.cancel()
+        if self.recorder is not None:
+            if self._mic_permission is None:
+                self.request_microphone()
+                self.set_status(Status.IDLE, "· Concede acceso al micrófono y vuelve a pulsar")
+                return
+            if self._mic_permission is PermissionState.DENIED:
+                self._show_message(
+                    "Permiso de micrófono denegado", MIC_DENIED_MESSAGE, "microphone"
+                )
+                return
+            try:
+                self.recorder.start()
+            except AudioDeviceError as exc:
+                self.set_status(Status.ERROR)
+                self._show_message("Micrófono no disponible", str(exc), "microphone")
+                return
         self.recording = True
         self._recording_started_at = time.monotonic()
         self._set_ask_recording_style(True)
@@ -370,16 +425,67 @@ class MainWindow(QMainWindow):
             return
         self.recording = False
         self._set_ask_recording_style(False)
+        audio = self.recorder.stop() if self.recorder is not None else b""
         if time.monotonic() - self._recording_started_at < MIN_HOLD_SECONDS:
             self.set_status(Status.IDLE, f"· {HOLD_TO_TALK_HINT}")
             return
         self.set_status(Status.IDLE)
         self.voice_question_finished.emit()
+        self._ask(None, audio)
 
     def _send_text_question(self) -> None:
         question = self.question_input.text().strip()
         if question:
             self.ask_requested.emit(question)
+            self.question_input.clear()
+            self._ask(question, None)
+
+    def _ask(self, question: str | None, audio: bytes | None) -> None:
+        if self.assistant is None:
+            return
+        prompt = build_prompt(self.emotion_summary(), question)
+        self.last_prompt = prompt
+        self.set_caption(f"Tú: {question}" if question else "Tú: (pregunta por voz)")
+        self.set_status(Status.PROCESSING)
+        self.assistant.ask(prompt, audio or None)
+
+    # --- GPT-Live -----------------------------------------------------------
+
+    def request_microphone(self) -> None:
+        self._request_permission("microphone", self._on_microphone_permission, self)
+
+    def _on_microphone_permission(self, state: PermissionState) -> None:
+        self._mic_permission = state
+
+    def _on_audio_started(self) -> None:
+        self.set_status(Status.PLAYING)
+
+    def _on_answer(self, text: str) -> None:
+        self.set_caption(f"GPT-Live: {text}" if text else "")
+
+    def _on_answer_finished(self) -> None:
+        self.set_status(Status.IDLE)
+
+    def _on_assistant_failed(self, message: str) -> None:
+        self.set_status(Status.ERROR)
+        self._show_message("GPT-Live no ha podido responder", message)
+
+    def _on_new_chat(self) -> None:
+        if self.recording:
+            self.recording = False
+            self._set_ask_recording_style(False)
+            if self.recorder is not None:
+                self.recorder.stop()
+        if self.assistant is not None:
+            self.assistant.new_chat()
+        self.question_input.clear()
+        self.set_caption("")
+        self.set_status(Status.IDLE, "· Nuevo chat")
+        self.new_chat_requested.emit()
+
+    def set_caption(self, text: str) -> None:
+        self.caption_label.setText(text)
+        self.caption_label.setVisible(bool(text))
 
     def _set_ask_recording_style(self, recording: bool) -> None:
         self.ask_button.setProperty("recording", recording)
@@ -401,4 +507,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.stop_camera()
+        if self.recorder is not None:
+            self.recorder.stop()
+        if self.assistant is not None:
+            self.assistant.shutdown()
+            self.assistant = None
         super().closeEvent(event)
