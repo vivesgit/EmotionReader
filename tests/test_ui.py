@@ -2,6 +2,7 @@ from functools import partial
 
 import pytest
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QMessageBox
 
 from config import Settings
@@ -11,6 +12,7 @@ from emotion_reader.camera import (
     PermissionState,
     SyntheticCapture,
 )
+from emotion_reader.detector import EMOTION_LABELS_ES, EmotionDetector, ModelDownloadError
 from ui import main_window
 from ui.main_window import PRIVACY_NOTICE, MainWindow, Status
 
@@ -34,17 +36,77 @@ class ClosedCapture:
         pass
 
 
+class HappyFaceDetector:
+    def detect(self, _frame):
+        return [(200, 140, 160, 160)]
+
+
+class FixedClassifier:
+    def classify(self, _face):
+        return {label: 0.0 for label in EMOTION_LABELS_ES.values()} | {
+            "alegría": 0.8,
+            "sorpresa": 0.2,
+        }
+
+
+def fake_detector():
+    return EmotionDetector(HappyFaceDetector(), FixedClassifier())
+
+
+def broken_detector():
+    raise ModelDownloadError("No se ha podido descargar el modelo de prueba.")
+
+
 @pytest.fixture
 def make_window(qtbot):
-    def factory(capture_factory=lambda _i: SyntheticCapture(), permission=grant):
+    def factory(
+        capture_factory=lambda _i: SyntheticCapture(),
+        permission=grant,
+        detector_factory=fake_detector,
+    ):
         window = MainWindow(
-            Settings(), capture_factory=capture_factory, request_permission_fn=permission
+            Settings(),
+            capture_factory=capture_factory,
+            request_permission_fn=permission,
+            detector_factory=detector_factory,
         )
         qtbot.addWidget(window)
         window.show()
         return window
 
     return factory
+
+
+def test_live_emotion_overlay_and_summary(qtbot, make_window):
+    window = make_window()
+    window.start_camera()
+    qtbot.waitUntil(lambda: window.latest_reading is not None, timeout=3000)
+    qtbot.waitUntil(lambda: window.emotion_label.text() == "Alegría · 80%", timeout=3000)
+
+    image = QImage(640, 480, QImage.Format.Format_RGB32)
+    image.fill(QColor("black"))
+    window._draw_overlay(image)
+    assert window.latest_reading.box == (184, 124, 192, 192)
+    border = image.pixelColor(184, 220)
+    assert (border.red(), border.green(), border.blue()) == (0, 168, 232)
+    assert image.pixelColor(280, 220) == QColor("black")
+
+    qtbot.waitUntil(lambda: window.emotion_summary().frames_with_face >= 4, timeout=3000)
+    summary = window.emotion_summary()
+    assert summary.dominant == "alegría"
+    assert summary.window_seconds == Settings().emotion_window_seconds
+    window.close()
+    assert window.emotion_worker is None
+
+
+def test_emotion_model_failure_is_reported(qtbot, make_window):
+    window = make_window(detector_factory=broken_detector)
+    window.start_camera()
+    qtbot.waitUntil(lambda: window.message_box is not None, timeout=3000)
+    assert window.message_box.windowTitle() == "Detección de emociones no disponible"
+    assert "modelo de prueba" in window.message_box.text()
+    assert window.emotion_label.text() == "Emociones no disponibles"
+    qtbot.waitUntil(lambda: window.camera_active, timeout=2000)
 
 
 def test_initial_layout(make_window):

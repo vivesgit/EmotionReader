@@ -135,6 +135,25 @@ class SyntheticCapture:
         self._open = False
 
 
+class ImageCapture:
+    """Serves a still photo as if it were a webcam, to try emotion detection without a camera."""
+
+    def __init__(self, path: str) -> None:
+        self._image = cv2.imread(path)
+        if self._image is None:
+            raise ValueError(f"No se ha podido leer la imagen {path!r}")
+        self._open = True
+
+    def isOpened(self) -> bool:
+        return self._open
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        return (True, self._image.copy()) if self._open else (False, None)
+
+    def release(self) -> None:
+        self._open = False
+
+
 class CameraWorker(QThread):
     """Reads frames on a background thread. Frames stay in memory and are never stored."""
 
